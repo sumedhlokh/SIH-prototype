@@ -278,16 +278,26 @@ def get_ocr_reader():
         return None
 
 
-def run_ocr(pil_img: Image.Image, reader) -> list:
-    """
-    Returns list of dicts: {text, confidence (0-1), bbox (4 points), height_px}
-    Uses Tesseract's word-level output (image_to_data) so each row is one word/token,
-    matching the granularity the rest of the app (rule engine, PDP height check) expects.
-    """
-    if not reader:
-        return []
-    arr = np.array(pil_img.convert("RGB"))
-    data = pytesseract.image_to_data(arr, output_type=TesseractOutput.DICT)
+def _rotate_point_back(nx: float, ny: float, angle: int, orig_w: int, orig_h: int) -> tuple:
+    """Map a point from a rotated image's coordinate space back to the ORIGINAL image's space.
+    angle is the clockwise rotation (0/90/180/270) that was applied to produce the image the
+    point was detected in. Verified against known corner positions before use."""
+    if angle == 0:
+        return nx, ny
+    elif angle == 90:
+        return ny, orig_h - 1 - nx
+    elif angle == 180:
+        return orig_w - 1 - nx, orig_h - 1 - ny
+    elif angle == 270:
+        return orig_w - 1 - ny, nx
+    return nx, ny
+
+
+def _ocr_single_orientation(arr_rgb: np.ndarray, angle: int, orig_w: int, orig_h: int) -> list:
+    rot_code = {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+                270: cv2.ROTATE_90_COUNTERCLOCKWISE}[angle]
+    rotated = cv2.rotate(arr_rgb, rot_code) if rot_code is not None else arr_rgb
+    data = pytesseract.image_to_data(rotated, output_type=TesseractOutput.DICT)
     rows = []
     n = len(data["text"])
     for i in range(n):
@@ -301,17 +311,40 @@ def run_ocr(pil_img: Image.Image, reader) -> list:
             continue
         left, top = data["left"][i], data["top"][i]
         width, height = data["width"][i], data["height"][i]
-        bbox = [
-            [left, top], [left + width, top],
-            [left + width, top + height], [left, top + height],
-        ]
+        # corners in the ROTATED image's own coordinate space...
+        corners_rot = [(left, top), (left + width, top), (left + width, top + height), (left, top + height)]
+        # ...mapped back into the ORIGINAL image's coordinate space so every token from every
+        # orientation lives in one consistent frame (required for the column/grid alignment logic).
+        bbox = [list(_rotate_point_back(cx, cy, angle, orig_w, orig_h)) for cx, cy in corners_rot]
         rows.append({
             "text": text,
             "confidence": conf_raw / 100.0,
             "bbox": bbox,
             "height_px": float(height),
-            "line_key": (data.get("block_num", [0]*n)[i], data.get("par_num", [0]*n)[i], data.get("line_num", [0]*n)[i]),
+            "line_key": (angle, data.get("block_num", [0]*n)[i], data.get("par_num", [0]*n)[i], data.get("line_num", [0]*n)[i]),
         })
+    return rows
+
+
+def run_ocr(pil_img: Image.Image, reader, scan_rotations: bool = True) -> list:
+    """
+    Returns list of dicts: {text, confidence (0-1), bbox (4 points, ORIGINAL-image coordinates),
+    height_px}. Uses Tesseract's word-level output (image_to_data) so each row is one word/token,
+    matching the granularity the rest of the app (rule engine, PDP height check) expects.
+
+    Tesseract assumes horizontal text; it will not reliably read text printed sideways (a common
+    layout on pouch seams / side panels). When scan_rotations is True, the image is additionally
+    OCR'd at 90/180/270 degrees and every hit is mapped back to the original image's coordinates,
+    so sideways text is still found and still lines up correctly with everything else.
+    """
+    if not reader:
+        return []
+    arr = np.array(pil_img.convert("RGB"))
+    orig_h, orig_w = arr.shape[:2]
+    angles = (0, 90, 180, 270) if scan_rotations else (0,)
+    rows = []
+    for angle in angles:
+        rows.extend(_ocr_single_orientation(arr, angle, orig_w, orig_h))
     return rows
 
 
@@ -1123,6 +1156,12 @@ with st.sidebar:
     use_clahe = st.checkbox("CLAHE contrast stretching", value=True)
     use_denoise = st.checkbox("Denoise (reduces glare speckle)", value=True)
     use_adaptive_threshold = st.checkbox("Adaptive thresholding", value=False)
+    scan_rotations = st.checkbox(
+        "Scan sideways / rotated text (slower, ~4x OCR time)", value=True,
+        help="Tesseract only reads horizontal text by default. Turn this on to also catch text "
+             "printed sideways on pouch seams or side panels. Turn off only if you need speed "
+             "and are sure all your text is upright.",
+    )
 
     st.subheader("Confidence & PDP")
     conf_threshold = st.slider("Minimum field confidence to accept (%)", 0, 100, 50) / 100.0
@@ -1188,7 +1227,7 @@ with tab1:
                 pre_img = preprocess_pipeline(
                     pil_img, use_grayscale, use_clahe, use_denoise, use_adaptive_threshold, use_auto_upscale
                 )
-                ocr_rows = run_ocr(pre_img, reader)
+                ocr_rows = run_ocr(pre_img, reader, scan_rotations=scan_rotations)
                 for row in ocr_rows:
                     row["source"] = uf.name
                     store.raw_tokens.append(row)
